@@ -167,10 +167,13 @@ func NewHandler(cfg Config, opts ...HandlerOption) (*RewritingHandler, error) {
 	h.DELETE("/webapi/sessions", h.WithAuth(h.deleteSession))
 	h.POST("/webapi/sessions/renew", h.WithAuth(h.renewSession))
 
-	// Users
+	h.GET("/webapi/tokens/user/:token", httplib.MakeHandler(h.getUserToken))
+	h.POST("/webapi/tokens/process", httplib.WithCSRFProtection(h.processUserToken))
 	h.GET("/webapi/users/invites/:token", httplib.MakeHandler(h.renderUserInvite))
 	h.POST("/webapi/users", httplib.MakeHandler(h.createNewUser))
 	h.PUT("/webapi/users/password", h.WithAuth(h.changePassword))
+
+	h.POST("/webapi/sites/:site/namespaces/:namespace/users/:username/reset", h.WithClusterAuth(h.createUserResetToken))
 
 	// Issues SSH temp certificates based on 2FA access creds
 	h.POST("/webapi/ssh/certs", httplib.MakeHandler(h.createSSHCert))
@@ -179,6 +182,9 @@ func NewHandler(cfg Config, opts ...HandlerOption) (*RewritingHandler, error) {
 	h.GET("/webapi/sites", h.WithAuth(h.getClusters))
 
 	// Site specific API
+	h.GET("/webapi/sites/:site/namespaces/:namespace/invites", h.WithClusterAuth(h.getUserInvites))
+	h.POST("/webapi/sites/:site/namespaces/:namespace/invites", h.WithClusterAuth(h.createInviteToken))
+	h.DELETE("/webapi/sites/:site/namespaces/:namespace/invites/:username", h.WithClusterAuth(h.deleteUserInvite))
 
 	// get namespaces
 	h.GET("/webapi/sites/:site/namespaces", h.WithClusterAuth(h.getSiteNamespaces))
@@ -201,6 +207,9 @@ func NewHandler(cfg Config, opts ...HandlerOption) (*RewritingHandler, error) {
 	// scp file transfer
 	h.GET("/webapi/sites/:site/namespaces/:namespace/nodes/:server/:login/scp", h.WithClusterAuth(h.transferFile))
 	h.POST("/webapi/sites/:site/namespaces/:namespace/nodes/:server/:login/scp", h.WithClusterAuth(h.transferFile))
+
+	// web context
+	h.GET("/webapi/sites/:site/context", h.WithClusterAuth(h.getUserContext))
 
 	// OIDC related callback handlers
 	h.GET("/webapi/oidc/login/web", httplib.MakeHandler(h.oidcLoginWeb))
@@ -230,7 +239,6 @@ func NewHandler(cfg Config, opts ...HandlerOption) (*RewritingHandler, error) {
 
 	// User Status (used by client to check if user session is valid)
 	h.GET("/webapi/user/status", h.WithAuth(h.getUserStatus))
-	h.GET("/webapi/user/context", h.WithAuth(h.getUserContext))
 
 	// Issue host credentials.
 	h.POST("/webapi/host/credentials", httplib.MakeHandler(h.hostCredentials))
@@ -296,8 +304,7 @@ func NewHandler(cfg Config, opts ...HandlerOption) (*RewritingHandler, error) {
 				Session string
 				XCSRF   string
 			}{
-				XCSRF:   csrfToken,
-				Session: base64.StdEncoding.EncodeToString([]byte("{}")),
+				XCSRF: csrfToken,
 			}
 
 			ctx, err := h.AuthenticateRequest(w, r, false)
@@ -354,8 +361,8 @@ func (h *Handler) getUserStatus(w http.ResponseWriter, r *http.Request, _ httpro
 //
 // GET /webapi/user/context
 //
-func (h *Handler) getUserContext(w http.ResponseWriter, r *http.Request, _ httprouter.Params, c *SessionContext) (interface{}, error) {
-	clt, err := c.GetClient()
+func (h *Handler) getUserContext(w http.ResponseWriter, r *http.Request, p httprouter.Params, c *SessionContext, site reversetunnel.RemoteSite) (interface{}, error) {
+	clt, err := c.GetUserClient(site)
 	if err != nil {
 		return nil, trace.Wrap(err)
 	}
@@ -378,10 +385,13 @@ func (h *Handler) getUserContext(w http.ResponseWriter, r *http.Request, _ httpr
 	if err != nil {
 		return nil, trace.Wrap(err)
 	}
+
 	userContext, err := ui.NewUserContext(user, roleset)
 	if err != nil {
 		return nil, trace.Wrap(err)
 	}
+
+	userContext.Version = teleport.Version
 
 	return userContext, nil
 }
@@ -661,6 +671,13 @@ func (h *Handler) getWebConfig(w http.ResponseWriter, r *http.Request, p httprou
 	webCfg := ui.WebConfig{
 		Auth:            authSettings,
 		CanJoinSessions: canJoinSessions,
+	}
+
+	resource, err := h.cfg.ProxyClient.GetClusterName()
+	if err != nil {
+		log.Warn(err)
+	} else {
+		webCfg.ProxyClusterName = resource.GetClusterName()
 	}
 
 	out, err := json.Marshal(webCfg)
@@ -1166,6 +1183,51 @@ func (h *Handler) renewSession(w http.ResponseWriter, r *http.Request, _ httprou
 	return NewSessionResponse(newContext)
 }
 
+func (h *Handler) getUserInvites(w http.ResponseWriter, r *http.Request, p httprouter.Params, ctx *SessionContext, site reversetunnel.RemoteSite) (interface{}, error) {
+	clt, err := site.GetClient()
+	if err != nil {
+		return nil, trace.Wrap(err)
+	}
+
+	invites, err := clt.GetUserInvites()
+	if err != nil {
+		return nil, trace.Wrap(err)
+	}
+
+	return invites, nil
+}
+
+func (h *Handler) processUserToken(w http.ResponseWriter, r *http.Request, p httprouter.Params) (interface{}, error) {
+	var req services.UserTokenCompleteRequest
+	if err := httplib.ReadJSON(r, &req); err != nil {
+		return nil, trace.Wrap(err)
+	}
+
+	sess, err := h.auth.proxyClient.ProcessUserToken(req)
+	if err != nil {
+		return nil, trace.Wrap(err)
+	}
+	ctx, err := h.auth.ValidateSession(sess.GetUser(), sess.GetName())
+	if err != nil {
+		return nil, trace.Wrap(err)
+	}
+	if err := SetSession(w, sess.GetUser(), sess.GetName()); err != nil {
+		return nil, trace.Wrap(err)
+	}
+
+	return NewSessionResponse(ctx)
+}
+
+func (h *Handler) getUserToken(w http.ResponseWriter, r *http.Request, p httprouter.Params) (interface{}, error) {
+	userToken, err := h.auth.proxyClient.GetUserToken(p[0].Value)
+	if err != nil {
+		log.Errorf("failed to fetch user token: %v", trace.DebugReport(err))
+		// we hide the error from the remote user to avoid giving any hints
+		return nil, trace.AccessDenied("bad or expired token")
+	}
+	return userToken, nil
+}
+
 type renderUserInviteResponse struct {
 	InviteToken string `json:"invite_token"`
 	User        string `json:"user"`
@@ -1351,15 +1413,7 @@ func (h *Handler) createNewU2FUser(w http.ResponseWriter, r *http.Request, p htt
 // {"sites": {"name": "localhost", "last_connected": "RFC3339 time", "status": "active"}}
 //
 func (h *Handler) getClusters(w http.ResponseWriter, r *http.Request, p httprouter.Params, c *SessionContext) (interface{}, error) {
-	resource, err := h.cfg.ProxyClient.GetClusterName()
-	if err != nil {
-		return nil, trace.Wrap(err)
-	}
-
-	response := ui.NewAvailableClusters(resource.GetClusterName(),
-		h.cfg.Proxy.GetSites())
-
-	return response, nil
+	return ui.NewClusters(h.cfg.Proxy.GetSites()), nil
 }
 
 type getSiteNamespacesResponse struct {
@@ -1412,6 +1466,63 @@ func (h *Handler) siteNodesGet(w http.ResponseWriter, r *http.Request, p httprou
 
 	uiServers := ui.MakeServers(site.GetName(), servers)
 	return makeResponse(uiServers)
+}
+
+type inviteTokenReq struct {
+	Name  string   `json:"name"`
+	Roles []string `json:"roles"`
+}
+
+func (h *Handler) deleteUserInvite(w http.ResponseWriter, r *http.Request, p httprouter.Params, ctx *SessionContext, site reversetunnel.RemoteSite) (interface{}, error) {
+	clt, err := ctx.GetUserClient(site)
+	if err != nil {
+		return nil, trace.Wrap(err)
+	}
+
+	clt.DeleteUserInvite(p.ByName("username"))
+	if err != nil {
+		return nil, trace.Wrap(err)
+	}
+
+	return nil, nil
+}
+
+func (h *Handler) createUserResetToken(w http.ResponseWriter, r *http.Request, p httprouter.Params, ctx *SessionContext, site reversetunnel.RemoteSite) (interface{}, error) {
+	clt, err := ctx.GetUserClient(site)
+	if err != nil {
+		return nil, trace.Wrap(err)
+	}
+
+	resetToken, err := clt.CreateUserResetToken(services.CreateUserResetRequest{
+		Name: p.ByName("username"),
+		TTL:  defaults.UserResetTokenTTL,
+	})
+	if err != nil {
+		return nil, trace.Wrap(err)
+	}
+
+	return resetToken, nil
+}
+
+func (h *Handler) createInviteToken(w http.ResponseWriter, r *http.Request, p httprouter.Params, ctx *SessionContext, site reversetunnel.RemoteSite) (interface{}, error) {
+	clt, err := ctx.GetUserClient(site)
+	if err != nil {
+		return nil, trace.Wrap(err)
+	}
+	var req inviteTokenReq
+	if err := httplib.ReadJSON(r, &req); err != nil {
+		return nil, trace.Wrap(err)
+	}
+
+	inviteToken, err := clt.CreateInviteToken(services.CreateUserInviteRequest{
+		Name:  req.Name,
+		Roles: req.Roles,
+	})
+	if err != nil {
+		return nil, trace.Wrap(err)
+	}
+
+	return inviteToken, nil
 }
 
 // siteNodeConnect connect to the site node
@@ -2013,17 +2124,17 @@ func (h *Handler) WithClusterAuth(fn ClusterHandler) httprouter.Handle {
 			log.Info(err)
 			return nil, trace.Wrap(err)
 		}
-		siteName := p.ByName("site")
-		if siteName == currentSiteShortcut {
+		clusterName := p.ByName("site")
+		if clusterName == currentSiteShortcut {
 			res, err := h.cfg.ProxyClient.GetClusterName()
 			if err != nil {
 				log.Warn(err)
 				return nil, trace.Wrap(err)
 			}
 
-			siteName = res.GetClusterName()
+			clusterName = res.GetClusterName()
 		}
-		site, err := h.cfg.Proxy.GetSite(siteName)
+		site, err := h.cfg.Proxy.GetSite(clusterName)
 		if err != nil {
 			log.Warn(err)
 			return nil, trace.Wrap(err)

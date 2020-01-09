@@ -168,11 +168,7 @@ func (s *AuthServer) AuthenticateWebUser(req AuthenticateUserRequest) (services.
 		return nil, trace.Wrap(err)
 	}
 
-	// Disable all local auth requests,
-	// except session ID renewal requests that are using the same method.
-	// This condition uses Session as a blanket check, because any new method added
-	// to the local auth will be disabled by default.
-	if clusterConfig.GetLocalAuth() == false && req.Session == nil {
+	if clusterConfig.GetLocalAuth() == false {
 		s.emitNoLocalAuthEvent(req.Username)
 		return nil, trace.AccessDenied(noLocalAuth)
 	}
@@ -184,22 +180,21 @@ func (s *AuthServer) AuthenticateWebUser(req AuthenticateUserRequest) (services.
 		}
 		return session, nil
 	}
+
 	if err := s.AuthenticateUser(req); err != nil {
 		return nil, trace.Wrap(err)
 	}
+
 	user, err := s.GetUser(req.Username, false)
 	if err != nil {
 		return nil, trace.Wrap(err)
 	}
-	// It's safe to extract the roles and traits directly from services.User as
-	// this endpoint is only used for local accounts.
-	sess, err := s.NewWebSession(req.Username, user.GetRoles(), user.GetTraits())
+
+	sess, err := s.createUserWebSession(user)
 	if err != nil {
 		return nil, trace.Wrap(err)
 	}
-	if err := s.UpsertWebSession(req.Username, sess); err != nil {
-		return nil, trace.Wrap(err)
-	}
+
 	sess, err = services.GetWebSessionMarshaler().GenerateWebSession(sess)
 	if err != nil {
 		return nil, trace.Wrap(err)
